@@ -33,8 +33,10 @@ payload types, storage folders and code references.
 
 ## Accuracy
 
-Content was hand-built from the source of `ls-keeper-data-bridge-backend` (as of
-October 2026). The animation is illustrative: stage order and names match the code,
-timings do not. If the pipeline changes, edit the `NODES`, `EDGES` and `TIMELINE`
-constants in `index.html` — the source files it was derived from are listed in a
-comment at the top of the file.
+Content was hand-built from `origin/develop` of `ls-keeper-data-bridge-backend`
+(@ `4c6761e`, October 2026 — `main` is behind and lacks the `optimise` stage).
+The animation is illustrative: stage order and names match the code, timings do not.
+It deliberately covers only the import pipeline — the separate CPH export, storage
+report and cleanse flows are not depicted. If the pipeline changes, edit the `NODES`,
+`EDGES` and `TIMELINE` constants in `index.html` — the source files it was derived
+from are listed in a comment at the top of the file.

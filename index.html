@@ -6,15 +6,19 @@
 <title>LS Keeper Data Bridge — ETL pipeline</title>
 <!--
   Animated explainer of the ls-keeper-data-bridge-backend ETL pipeline.
-  Hand-maintained from the source (October 2026). If the pipeline changes, edit the
+  Hand-maintained from origin/develop @ 4c6761e (October 2026) — note main is behind
+  develop here (no optimise stage). If the pipeline changes, edit the
   NODES / EDGES / TIMELINE constants below. Derived from:
 
     src/KeeperData.Core/EtlPipeline/EtlPipelineFactory.cs         (stage order)
     src/KeeperData.Core/EtlPipeline/Stages/*.cs                   (stage behaviour)
+    src/KeeperData.Core/EtlPipeline/Concurrency/*.cs              (parallel file processing)
     src/KeeperData.Core/EtlPipeline/Storage/EtlPipelineFolders.cs (artefact folders)
+    src/KeeperData.Core/EtlPipeline/Storage/EtlStageCascade.cs    (rebuild/purge)
+    src/KeeperData.Core/EtlPipeline/Views/SqliteViewDefinition.cs (read-model parts)
     src/KeeperData.Core/ETL/Impl/StandardDataSetDefinitionsBuilder.cs (datasets)
+    src/KeeperData.Bridge/Controllers/Etl*.cs                     (trigger + download API)
     src/KeeperData.Bridge.Worker/Coordination/EtlImportCoordinator.cs  (trigger/lock)
-    src/KeeperData.Core/EtlPipeline/Status/EtlImportStatusObserver.cs  (status model)
 -->
 <style>
   :root {
@@ -73,6 +77,7 @@
   .node-desc { font-size: 9.5px; fill: var(--muted); }
   .node-title.cap-tech, .node-desc.cap-tech { font-family: ui-monospace, Consolas, "Courier New", monospace; }
   .node-lock { font-size: 9px; fill: var(--amber); font-weight: 700; }
+  .node-par { font-size: 8.5px; fill: var(--blue); font-weight: 700; }
   .node-icon { fill: none; stroke: var(--muted); stroke-width: 1.6; }
   .node.active .node-card { stroke: var(--blue); stroke-width: 3; filter: url(#glow); }
   .node.done .node-card { stroke: var(--green); }
@@ -173,10 +178,13 @@
 <footer>
   <details>
     <summary>Sources &amp; accuracy</summary>
-    <p>Built by hand from <code>ls-keeper-data-bridge-backend</code> (October 2026). Stage order comes from
-    <code>EtlPipelineFactory</code>; stage behaviour from the classes in
-    <code>src/KeeperData.Core/EtlPipeline/Stages</code>; dataset definitions from
-    <code>StandardDataSetDefinitionsBuilder</code>; run coordination from <code>EtlImportCoordinator</code>.
+    <p>Built by hand from <code>ls-keeper-data-bridge-backend</code>, <code>develop</code> branch @
+    <code>4c6761e</code> (October 2026) — <code>main</code> is behind and lacks the optimise stage.
+    Stage order comes from <code>EtlPipelineFactory</code>; stage behaviour from
+    <code>src/KeeperData.Core/EtlPipeline/Stages</code> and <code>Concurrency</code>; the read-model
+    transform from <code>SqliteViewDefinition</code>; dataset definitions from
+    <code>StandardDataSetDefinitionsBuilder</code>; run coordination from <code>EtlImportCoordinator</code>;
+    download endpoints from the <code>Etl*</code> controllers.
     Timings, counts and row volumes are illustrative — the real run reports live numbers via
     <code>GET /api/etl/imports/{id}</code>.</p>
   </details>
@@ -191,25 +199,25 @@ const DS_COLORS = ["#1d70b8", "#00703c", "#4c2c92", "#d4351c", "#f47738", "#5694
 
 const LANE = { y: 26, h: 440, fill: "var(--lane-b)",
   title: "ETL import pipeline",
-  sub: "POST /api/etl/imports · daily job · etl run — one run at a time (distributed lock)" };
+  sub: "POST /api/etl/imports(?dataset= ?rebuild=true) · scheduled job · etl run — one run at a time (distributed lock)" };
 
 /* kind: trigger | s3 | stage | consumer */
 const NODES = [
   { id: "etl_trigger", kind: "trigger", lock: true, x: 24, y: 170, w: 170, h: 116,
     title: { s: "Import request", t: "api/etl/imports" },
-    desc:  { s: ["API call, daily job or", "the etl CLI queues a run"],
-             t: ["POST /api/etl/imports", "EtlImportJob (daily)", "etl run (CLI)"] },
-    info:  "EtlImportController / EtlImportJob / etl run → EtlImportCoordinator: takes the import distributed lock, writes a queued status record, runs the pipeline in the background. rebuild=true clears the stage folders first (EtlStageCascade)." },
+    desc:  { s: ["API call, scheduled job", "or the etl CLI"],
+             t: ["POST /api/etl/imports", "?dataset= ?rebuild=true", "EtlImportJob · etl run"] },
+    info:  "EtlImportController / EtlImportJob / etl run → EtlImportCoordinator: takes the import distributed lock, writes a queued status record, runs the pipeline in the background. ?dataset= scopes a run to one dataset; ?sourceType=external|internal picks the bucket; rebuild=true clears the stage folders first (EtlStageCascade, also exposed as etl purge / DELETE /api/etl/storage)." },
   { id: "ext_s3", kind: "s3", x: 218, y: 170, w: 150, h: 116,
     title: { s: "Supplier bucket", t: "external S3" },
     desc:  { s: ["Encrypted extracts", "land here"],
-             t: ["litprd/LITP_* (PSV)", "cads/cts/* (H/C/D/T)", "bulk + delta lanes"] },
-    info:  "Supplier-owned S3. Two file families: LITP_* extracts (SAM, CTS holdings, AMLS2, AMES) and CTS CADS tables with a baseline (BULK) lane plus daily deltas. ~18 dataset definitions." },
+             t: ["litprd/LITP_* — 12 PSV", "cads/cts/{bulk,daily}", "— 6 H/C/D/T tables"] },
+    info:  "Supplier-owned S3. 18 dataset definitions, all delta mode: 12 LITP_* extracts (SAM, CTS holdings, AMLS2, AMES) and 6 CTS CADS tables (audit columns, CtsDerived passwords) with a baseline BULK lane plus daily deltas." },
   { id: "consumer", kind: "consumer", x: 1368, y: 170, w: 96, h: 116,
     title: { s: "Consumers", t: "consumers" },
     desc:  { s: ["Presigned-URL", "downloads"],
-             t: ["GET cphs/latest", "GET imports/{id}"] },
-    info:  "Read model consumers: GET /api/etl/sqlite/cphs/latest returns a presigned URL; GET /api/etl/imports/{id} reports per-stage and per-dataset progress." }
+             t: ["staging GETs:", "sqlite/latest", "snaps/{ds}"] },
+    info:  "Read model consumers: GET /api/etl/staging/sqlite/latest returns a short-lived presigned URL (PII → capped expiry); staging/duckdb/latest and staging/snapshots/{dataset}/latest expose the intermediate artefacts too. GET /api/etl/datasets lists the catalogue; GET /api/etl/imports/{id} reports per-stage and per-dataset progress. views/ is shared with the separate cphs_ export — the krds-db_ prefix distinguishes the read model." }
 ];
 
 const STAGE_IDS = ["st_source","st_discover","st_decrypt","st_normalise","st_optimise","st_snapshot","st_duckdb","st_sqlite"];
@@ -218,32 +226,32 @@ const STAGE_DEFS = [
     title: { s: "Scan source", t: "source:external" },
     desc:  { s: ["Match every file to", "a known dataset"],
              t: ["S3RawFolderSource", "→ DiscoveredFile"] },
-    info:  "S3RawFolderSource (ISourceStage): lists the supplier bucket via the external catalogue and matches objects to ~18 DataSetDefinitions. A dataset filter restricts the run." },
+    info:  "S3RawFolderSource (ISourceStage): lists the supplier bucket via the external catalogue and matches objects to the 18 DataSetDefinitions. A dataset filter restricts the run." },
   { id: "st_discover",  artefact: null,
     title: { s: "Group files", t: "discover" },
     desc:  { s: ["One file set", "per dataset"],
              t: ["DiscoverStage", "→ DiscoveredFileSet"] },
     info:  "DiscoverStage (GroupStage): groups discovered files by dataset; datasets with no files are dropped." },
-  { id: "st_decrypt",   artefact: "raw/",
+  { id: "st_decrypt",   artefact: "raw/", parallel: true,
     title: { s: "Decrypt", t: "decrypt" },
     desc:  { s: ["AES key derived from", "the file name"],
-             t: ["DecryptStage", "→ RawFileSet", "skips existing"] },
-    info:  "DecryptStage → raw/: streams source→decrypt→upload (nothing buffered). Password derived from the file name; CTS names derive it from the timestamp + reversed segments. Idempotent — existing raw objects are skipped." },
-  { id: "st_normalise", artefact: "normalised/",
+             t: ["DecryptStage", "→ RawFileSet", "∥ IO budget"] },
+    info:  "DecryptStage → raw/: streams source→decrypt→upload (nothing buffered), files concurrently against the IO budget (ParallelMapStage). Password derived from the file name; CTS names derive it from the timestamp + reversed segments. Idempotent — existing raw objects are skipped." },
+  { id: "st_normalise", artefact: "normalised/", parallel: true,
     title: { s: "Standardise", t: "normalise" },
     desc:  { s: ["CSV and H/C/D/T", "become Parquet"],
-             t: ["NormaliseStage", "PSV + HCDT → parquet", "→ NormalisedFileSet"] },
-    info:  "NormaliseStage → normalised/<dataset>/*.parquet: simple PSVs are converted directly; legacy H/C/D/T files go through the XSV normaliser with header/trailer validation. Empty files produce nothing." },
-  { id: "st_optimise",  artefact: "optimised/",
+             t: ["NormaliseStage", "PSV+HCDT → parquet", "∥ CPU budget"] },
+    info:  "NormaliseStage → normalised/<dataset>/*.parquet: files converted concurrently against the CPU budget (ParallelMapStage). Simple PSVs convert directly; legacy H/C/D/T files go through the XSV normaliser with header/trailer validation. Empty files produce nothing." },
+  { id: "st_optimise",  artefact: "optimised/", parallel: true,
     title: { s: "Shape data", t: "optimise" },
     desc:  { s: ["Keep the right", "columns + types"],
-             t: ["OptimiseStage", "→ OptimisedFileSet", "types + projection"] },
-    info:  "OptimiseStage → optimised/: include/exclude columns, declared or auto-detected column types (first row group), row filters. Unconfigured datasets pass through untouched." },
+             t: ["OptimiseStage", "→ OptimisedFileSet", "∥ CPU budget"] },
+    info:  "OptimiseStage → optimised/: files processed concurrently against the CPU budget (ParallelMapStage). Include/exclude columns, declared or auto-detected column types (first row group), row filters. Unconfigured datasets pass through untouched." },
   { id: "st_snapshot",  artefact: "snapshots/",
     title: { s: "Snapshot", t: "snapshot" },
     desc:  { s: ["Merge deltas onto", "the snapshot"],
              t: ["SnapshotStage", "→ SnapshotFile", "timestamp-named"] },
-    info:  "SnapshotStage → snapshots/: delta datasets fold each new file onto the latest snapshot (last-writer-wins, baseline-hash aware); snapshot datasets copy the latest file. Names carry the newest source timestamp, so a re-run with nothing newer reuses the snapshot." },
+    info:  "SnapshotStage → snapshots/: all datasets are delta mode — each new file folds onto the latest snapshot, oldest first (last-writer-wins). Names carry the newest source timestamp (resume state); baseline-hash in the name detects a changed bulk set and rebuilds from it. A re-run with nothing newer reuses the snapshot." },
   { id: "st_duckdb",    artefact: "staging/",
     title: { s: "Load DuckDB", t: "load-duckdb" },
     desc:  { s: ["All snapshots in", "one DuckDB"],
@@ -252,8 +260,8 @@ const STAGE_DEFS = [
   { id: "st_sqlite",    artefact: "views/",
     title: { s: "Publish view", t: "export-sqlite" },
     desc:  { s: ["SQL transform →", "SQLite read model"],
-             t: ["ExportSqliteStage", "→ SqliteExportFile", "krds-db.sqlite"] },
-    info:  "ExportSqliteStage → views/*.sqlite: a versioned SQL transform builds the read model; an artefact written by an older transform version is rebuilt." }
+             t: ["ExportSqliteStage", "→ SqliteExportFile", "2 SQL parts"] },
+    info:  "ExportSqliteStage → views/krds-db_<ts>.sqlite: the transform is two ordered parts — krds-read-model (SAM, required: Party/Holding/Herd/HoldingAnimalProfile/PartyRole) and cts-open-locations (optional, skipped when no CTS staging tables). An artefact written by an older transform fingerprint is rebuilt." }
 ];
 STAGE_DEFS.forEach((s, i) => {
   NODES.push({ ...s, kind: "stage", x: 392 + i * 120, y: 170, w: 108, h: 116 });
@@ -321,6 +329,9 @@ for (const n of NODES) {
   if (n.lock) {
     txt(g, n.x + 10, n.y + n.h - 10, "⚿ one run at a time", "node-lock");
   }
+  if (n.parallel) {
+    txt(g, n.x + n.w - 8, n.y + n.h - 10, "∥ parallel", "node-par", "end");
+  }
   if (n.artefact) {
     const cg = el("g", { "class": "chip-group", id: "chip-" + n.id }, g);
     const cw = Math.max(64, n.artefact.length * 6.4 + 16);
@@ -354,17 +365,17 @@ txt($("edge-labels"), 24, 336, "materialised artefacts (internal S3 bucket):", "
 /* dataset colour legend */
 const lg = $("legend");
 DS_COLORS.forEach((c, i) => el("circle", { cx: 30 + i * 14, cy: 396, r: 5, fill: c, "class": "packet" }, lg));
-txt(lg, 116, 400, "dataset colours — discovered files are grouped per dataset (~18 datasets: sam_*, cts_*, amls2_*, ames_*)", "dot-legend");
+txt(lg, 116, 400, "dataset colours — discovered files are grouped per dataset (18 datasets: 12 litprd extracts + 6 CTS CADS tables, all delta)", "dot-legend");
 
 /* ============================ timeline ============================ */
 
 const TIMELINE = [
   { dur: 2400, activate: ["etl_trigger"], packets: [{ edge: "etl_trigger->ext_s3", n: 1, color: "#0b0c0c" }],
-    cap: { s: "A run is requested — via the API, the daily job, or the ETL CLI. Only one runs at a time.",
-           t: "EtlImportCoordinator takes the import lock, writes a queued record, runs in background." } },
+    cap: { s: "A run is requested — via the API, the scheduled job, or the ETL CLI. Only one runs at a time.",
+           t: "EtlImportCoordinator takes the import lock, writes a queued record, runs in background. Params: dataset=, sourceType=, rebuild=true." } },
   { dur: 2600, activate: ["ext_s3"], packets: [{ to: "ext_s3", kind: "rain", n: 6 }],
     cap: { s: "The supplier drops encrypted extract files into their bucket.",
-           t: "litprd/LITP_* PSV files + cads/cts/* H/C/D/T files (bulk baseline + daily deltas)." } },
+           t: "litprd/LITP_* PSV extracts + cads/cts/{bulk,daily} H/C/D/T tables (bulk baseline + daily deltas)." } },
   { dur: 3000, activate: ["st_source"], packets: [{ edge: "ext_s3->st_source", n: 6, ds: true }],
     counter: { id: "ext_s3", to: 42, label: "files" },
     cap: { s: "The source stage scans the bucket and matches every file to a known dataset.",
@@ -372,18 +383,18 @@ const TIMELINE = [
   { dur: 2800, activate: ["st_discover"], packets: [{ edge: "st_source->st_discover", n: 6, ds: true }],
     cap: { s: "Files are grouped into one set per dataset.",
            t: "DiscoverStage groups into a DiscoveredFileSet per dataset; empty datasets drop out." } },
-  { dur: 3000, activate: ["st_decrypt"], packets: [{ edge: "st_discover->st_decrypt", n: 5, ds: true }],
+  { dur: 3000, activate: ["st_decrypt"], packets: [{ edge: "st_discover->st_decrypt", n: 5, ds: true, burst: true }],
     chips: ["st_decrypt"],
-    cap: { s: "Each file is AES-decrypted as it streams in — the password comes from the file name itself.",
-           t: "DecryptStage streams decrypt→raw/ (CTS derives the password from the name). Existing objects are skipped." } },
-  { dur: 3200, activate: ["st_normalise"], packets: [{ edge: "st_decrypt->st_normalise", n: 5, ds: true }],
+    cap: { s: "Each file is AES-decrypted as it streams in — several at once; the password comes from the file name itself.",
+           t: "DecryptStage (ParallelMapStage, IO budget): files decrypt→raw/ concurrently. CTS derives the password from the name; existing objects skipped." } },
+  { dur: 3200, activate: ["st_normalise"], packets: [{ edge: "st_decrypt->st_normalise", n: 5, ds: true, burst: true }],
     chips: ["st_normalise"],
-    cap: { s: "CSV and legacy header/data/trailer files become columnar Parquet — one format from here on.",
-           t: "NormaliseStage → normalised/<dataset>/*.parquet. H/C/D/T files get header/trailer validation." } },
-  { dur: 3000, activate: ["st_optimise"], packets: [{ edge: "st_normalise->st_optimise", n: 4, ds: true }],
+    cap: { s: "CSV and legacy header/data/trailer files become columnar Parquet — again in parallel — one format from here on.",
+           t: "NormaliseStage (ParallelMapStage, CPU budget) → normalised/<dataset>/*.parquet. H/C/D/T files get header/trailer validation." } },
+  { dur: 3000, activate: ["st_optimise"], packets: [{ edge: "st_normalise->st_optimise", n: 4, ds: true, burst: true }],
     chips: ["st_optimise"],
     cap: { s: "Columns are projected, typed and rows filtered — each dataset keeps only what it needs.",
-           t: "OptimiseStage → optimised/: include/exclude, declared or sampled types, row filter; pass-through if unconfigured." } },
+           t: "OptimiseStage (ParallelMapStage, CPU budget) → optimised/: include/exclude, declared or sampled types, row filter; pass-through if unconfigured." } },
   { dur: 3400, activate: ["st_snapshot"], packets: [{ edge: "st_optimise->st_snapshot", n: 4, ds: true }],
     chips: ["st_snapshot"], counter: { id: "st_snapshot", to: 12384201, label: "rows" },
     cap: { s: "Deltas are folded onto the latest snapshot — after this step each dataset has one current truth.",
@@ -395,7 +406,7 @@ const TIMELINE = [
   { dur: 3400, activate: ["st_sqlite", "consumer"], packets: [{ edge: "st_duckdb->st_sqlite", n: 2 }, { edge: "st_sqlite->consumer", n: 2, color: "#00703c" }],
     chips: ["st_sqlite"],
     cap: { s: "A versioned SQL transform produces the SQLite read model that consumers download.",
-           t: "ExportSqliteStage → views/krds-db.sqlite; artefacts from an older transform version are rebuilt." } },
+           t: "ExportSqliteStage → views/krds-db_<ts>.sqlite: krds-read-model (SAM) + cts-open-locations (optional); older transform fingerprints rebuild." } },
   { dur: 3000, hold: true,
     cap: { s: "Run complete — encrypted files became a queryable read model. Restarting…",
            t: "Pipeline complete: raw/ → normalised/ → optimised/ → snapshots/ → staging/ → views/. Restarting…" } }
@@ -459,7 +470,8 @@ function beginStep() {
   (step.packets || []).forEach(p => {
     for (let i = 0; i < p.n; i++) {
       const spec = { ...p, color: p.ds ? nextDsColor() : p.color };
-      spawnPacket(spec, (p.delay || 0) + i * (step.dur * 0.55 / Math.max(1, p.n)));
+      const delay = p.burst ? i * 90 : (p.delay || 0) + i * (step.dur * 0.55 / Math.max(1, p.n));
+      spawnPacket(spec, delay);
     }
   });
   (step.chips || []).forEach(id => $("chip-" + id)?.classList.add("materialised"));
