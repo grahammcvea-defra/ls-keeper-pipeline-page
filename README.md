@@ -31,6 +31,8 @@ shown as chips appearing under the stage cards.
 A **Stakeholder / Engineer** toggle swaps plain-English descriptions for stage names,
 payload types, storage folders and code references.
 
+Presenting it? See [PRESENTER-NOTES.md](PRESENTER-NOTES.md) for anticipated Q&A.
+
 ## Accuracy
 
 Content was hand-built from `origin/develop` of `ls-keeper-data-bridge-backend`
