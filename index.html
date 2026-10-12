@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LS Keeper Data Bridge — ETL pipeline</title>
+<!--
+  Animated explainer of the ls-keeper-data-bridge-backend ETL pipeline.
+  Hand-maintained from the source (October 2026). If the pipeline changes, edit the
+  NODES / EDGES / TIMELINE constants below. Derived from:
+
+    src/KeeperData.Core/EtlPipeline/EtlPipelineFactory.cs         (stage order)
+    src/KeeperData.Core/EtlPipeline/Stages/*.cs                   (stage behaviour)
+    src/KeeperData.Core/EtlPipeline/Storage/EtlPipelineFolders.cs (artefact folders)
+    src/KeeperData.Core/ETL/Impl/StandardDataSetDefinitionsBuilder.cs (datasets)
+    src/KeeperData.Bridge.Worker/Coordination/EtlImportCoordinator.cs  (trigger/lock)
+    src/KeeperData.Core/EtlPipeline/Status/EtlImportStatusObserver.cs  (status model)
+-->
+<style>
+  :root {
+    --ink: #0b0c0c;
+    --muted: #505a5f;
+    --blue: #1d70b8;
+    --green: #00703c;
+    --amber: #f47738;
+    --grey: #b1b4b6;
+    --paper: #f8f9fa;
+    --card: #ffffff;
+    --lane-b: #eaf2f9;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: var(--ink);
+    background: var(--paper);
+  }
+  header {
+    display: flex; flex-wrap: wrap; gap: 10px 18px;
+    align-items: center; justify-content: space-between;
+    padding: 14px 20px;
+    background: var(--card);
+    border-bottom: 4px solid var(--green);
+  }
+  h1 { font-size: 1.25rem; margin: 0; }
+  .sub { color: var(--muted); font-size: .85rem; margin-top: 2px; }
+  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button, .seg {
+    font: inherit; font-size: .85rem;
+    border: 1px solid var(--grey); border-radius: 4px;
+    background: var(--card); color: var(--ink);
+    padding: 6px 12px; cursor: pointer;
+  }
+  button:hover { background: #f0f2f3; }
+  button:focus-visible, .seg input:focus-visible + span { outline: 3px solid #fd0; outline-offset: 1px; }
+  .seg { display: inline-flex; padding: 0; overflow: hidden; }
+  .seg span { padding: 6px 12px; }
+  .seg input { position: absolute; opacity: 0; }
+  .seg input:checked + span { background: var(--blue); color: #fff; }
+  .seg span + input + span { border-left: 1px solid var(--grey); }
+  main { padding: 0 12px 12px; }
+  .diagram-wrap { overflow-x: auto; }
+  svg { display: block; min-width: 1480px; width: 100%; height: auto; }
+
+  /* diagram chrome */
+  .lane-title { font-size: 15px; font-weight: 700; fill: var(--ink); }
+  .lane-sub { font-size: 11px; fill: var(--muted); }
+  .edge { fill: none; stroke: var(--grey); stroke-width: 2; marker-end: url(#arrow); }
+  .edge-label { font-size: 10px; fill: var(--muted); font-style: italic; }
+
+  .node-card { fill: var(--card); stroke: var(--grey); stroke-width: 1.5; }
+  .node-title { font-size: 12.5px; font-weight: 700; }
+  .node-desc { font-size: 9.5px; fill: var(--muted); }
+  .node-title.cap-tech, .node-desc.cap-tech { font-family: ui-monospace, Consolas, "Courier New", monospace; }
+  .node-lock { font-size: 9px; fill: var(--amber); font-weight: 700; }
+  .node-icon { fill: none; stroke: var(--muted); stroke-width: 1.6; }
+  .node.active .node-card { stroke: var(--blue); stroke-width: 3; filter: url(#glow); }
+  .node.done .node-card { stroke: var(--green); }
+  .node.done .done-tick { display: inline; }
+  .done-tick { display: none; stroke: var(--green); stroke-width: 3; fill: none; }
+  .node { cursor: pointer; }
+
+  .chip {
+    fill: #eef7f0; stroke: var(--green); stroke-width: 1;
+    opacity: .25; stroke-dasharray: 4 3; transition: opacity .4s;
+  }
+  .chip-text { font-size: 9.5px; fill: var(--green); font-family: ui-monospace, Consolas, monospace; opacity: .35; transition: opacity .4s; }
+  .chip-group.materialised .chip { opacity: 1; stroke-dasharray: none; }
+  .chip-group.materialised .chip-text { opacity: 1; }
+  .chip-group.materialised { animation: pop .35s ease-out; }
+  @keyframes pop { 50% { transform: scale(1.15); } }
+  .chip-group { transform-box: fill-box; transform-origin: center; }
+
+  .counter { font-size: 10px; font-weight: 700; fill: var(--blue); font-variant-numeric: tabular-nums; }
+
+  .packet { stroke: #fff; stroke-width: 1.5; filter: url(#soft); }
+
+  .cap-tech { display: none; }
+  body.aud-engineer .cap-tech { display: inline; }
+  body.aud-engineer .cap-simple { display: none; }
+
+  #narration {
+    margin: 8px auto 0; max-width: 1480px;
+    background: var(--card); border: 1px solid var(--grey); border-left: 6px solid var(--blue);
+    border-radius: 4px; padding: 10px 14px;
+    display: flex; gap: 12px; align-items: baseline; min-height: 44px;
+  }
+  #step-no { font-weight: 700; color: var(--blue); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  #step-text { font-size: .95rem; }
+  #info-bar {
+    margin: 8px auto 0; max-width: 1480px;
+    font-size: .8rem; color: var(--muted); padding: 0 6px; min-height: 18px;
+  }
+  #info-bar code { font-family: ui-monospace, Consolas, monospace; font-size: .75rem; color: var(--ink); }
+  footer { padding: 12px 20px 24px; color: var(--muted); font-size: .8rem; }
+  footer details { max-width: 1480px; margin: 0 auto; }
+  footer summary { cursor: pointer; }
+  footer code { font-family: ui-monospace, Consolas, monospace; font-size: .72rem; }
+  .dot-legend { font-size: 10px; fill: var(--muted); }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>LS Keeper Data Bridge — ETL pipeline</h1>
+    <div class="sub">Supplier files → S3 artefacts → a SQLite read model. Illustrative animation; stage names match the code.</div>
+  </div>
+  <div class="controls">
+    <div class="seg" role="radiogroup" aria-label="Audience">
+      <input type="radio" name="aud" id="aud-simple" value="simple" checked><span><label for="aud-simple">Stakeholder</label></span>
+      <input type="radio" name="aud" id="aud-engineer" value="engineer"><span><label for="aud-engineer">Engineer</label></span>
+    </div>
+    <button id="btn-play" aria-label="Pause">Pause</button>
+    <button id="btn-restart">Restart</button>
+    <button id="btn-skip">Skip to end</button>
+    <div class="seg" role="radiogroup" aria-label="Speed">
+      <input type="radio" name="spd" id="spd-half" value="0.5"><span><label for="spd-half">½×</label></span>
+      <input type="radio" name="spd" id="spd-one" value="1" checked><span><label for="spd-one">1×</label></span>
+      <input type="radio" name="spd" id="spd-two" value="2"><span><label for="spd-two">2×</label></span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="diagram-wrap">
+    <svg id="diagram" viewBox="0 0 1480 520" role="img" aria-labelledby="svg-title svg-desc">
+      <title id="svg-title">The ETL pipeline of the LS Keeper Data Bridge</title>
+      <desc id="svg-desc">An import run discovers files in the supplier's bucket, decrypts, normalises and optimises them to Parquet, merges each dataset into a snapshot, loads all snapshots into one DuckDB staging database, and publishes a SQLite read model.</desc>
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#b1b4b6"></path>
+        </marker>
+        <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+          <feDropShadow dx="0" dy="0" stdDeviation="5" flood-color="#1d70b8" flood-opacity="0.55"></feDropShadow>
+        </filter>
+        <filter id="soft" x="-60%" y="-60%" width="220%" height="220%">
+          <feDropShadow dx="0" dy="1" stdDeviation="1.5" flood-opacity="0.4"></feDropShadow>
+        </filter>
+      </defs>
+      <g id="lanes"></g>
+      <g id="edges"></g>
+      <g id="edge-labels"></g>
+      <g id="nodes"></g>
+      <g id="packets"></g>
+      <g id="legend"></g>
+    </svg>
+  </div>
+  <div id="narration"><span id="step-no"></span><span id="step-text">Loading…</span></div>
+  <div id="info-bar">Click any card for its technical detail.</div>
+</main>
+
+<footer>
+  <details>
+    <summary>Sources &amp; accuracy</summary>
+    <p>Built by hand from <code>ls-keeper-data-bridge-backend</code> (October 2026). Stage order comes from
+    <code>EtlPipelineFactory</code>; stage behaviour from the classes in
+    <code>src/KeeperData.Core/EtlPipeline/Stages</code>; dataset definitions from
+    <code>StandardDataSetDefinitionsBuilder</code>; run coordination from <code>EtlImportCoordinator</code>.
+    Timings, counts and row volumes are illustrative — the real run reports live numbers via
+    <code>GET /api/etl/imports/{id}</code>.</p>
+  </details>
+</footer>
+
+<script>
+"use strict";
+
+/* ============================== data ============================== */
+
+const DS_COLORS = ["#1d70b8", "#00703c", "#4c2c92", "#d4351c", "#f47738", "#5694ca"];
+
+const LANE = { y: 26, h: 440, fill: "var(--lane-b)",
+  title: "ETL import pipeline",
+  sub: "POST /api/etl/imports · daily job · etl run — one run at a time (distributed lock)" };
+
+/* kind: trigger | s3 | stage | consumer */
+const NODES = [
+  { id: "etl_trigger", kind: "trigger", lock: true, x: 24, y: 170, w: 170, h: 116,
+    title: { s: "Import request", t: "api/etl/imports" },
+    desc:  { s: ["API call, daily job or", "the etl CLI queues a run"],
+             t: ["POST /api/etl/imports", "EtlImportJob (daily)", "etl run (CLI)"] },
+    info:  "EtlImportController / EtlImportJob / etl run → EtlImportCoordinator: takes the import distributed lock, writes a queued status record, runs the pipeline in the background. rebuild=true clears the stage folders first (EtlStageCascade)." },
+  { id: "ext_s3", kind: "s3", x: 218, y: 170, w: 150, h: 116,
+    title: { s: "Supplier bucket", t: "external S3" },
+    desc:  { s: ["Encrypted extracts", "land here"],
+             t: ["litprd/LITP_* (PSV)", "cads/cts/* (H/C/D/T)", "bulk + delta lanes"] },
+    info:  "Supplier-owned S3. Two file families: LITP_* extracts (SAM, CTS holdings, AMLS2, AMES) and CTS CADS tables with a baseline (BULK) lane plus daily deltas. ~18 dataset definitions." },
+  { id: "consumer", kind: "consumer", x: 1368, y: 170, w: 96, h: 116,
+    title: { s: "Consumers", t: "consumers" },
+    desc:  { s: ["Presigned-URL", "downloads"],
+             t: ["GET cphs/latest", "GET imports/{id}"] },
+    info:  "Read model consumers: GET /api/etl/sqlite/cphs/latest returns a presigned URL; GET /api/etl/imports/{id} reports per-stage and per-dataset progress." }
+];
+
+const STAGE_IDS = ["st_source","st_discover","st_decrypt","st_normalise","st_optimise","st_snapshot","st_duckdb","st_sqlite"];
+const STAGE_DEFS = [
+  { id: "st_source",    artefact: null,
+    title: { s: "Scan source", t: "source:external" },
+    desc:  { s: ["Match every file to", "a known dataset"],
+             t: ["S3RawFolderSource", "→ DiscoveredFile"] },
+    info:  "S3RawFolderSource (ISourceStage): lists the supplier bucket via the external catalogue and matches objects to ~18 DataSetDefinitions. A dataset filter restricts the run." },
+  { id: "st_discover",  artefact: null,
+    title: { s: "Group files", t: "discover" },
+    desc:  { s: ["One file set", "per dataset"],
+             t: ["DiscoverStage", "→ DiscoveredFileSet"] },
+    info:  "DiscoverStage (GroupStage): groups discovered files by dataset; datasets with no files are dropped." },
+  { id: "st_decrypt",   artefact: "raw/",
+    title: { s: "Decrypt", t: "decrypt" },
+    desc:  { s: ["AES key derived from", "the file name"],
+             t: ["DecryptStage", "→ RawFileSet", "skips existing"] },
+    info:  "DecryptStage → raw/: streams source→decrypt→upload (nothing buffered). Password derived from the file name; CTS names derive it from the timestamp + reversed segments. Idempotent — existing raw objects are skipped." },
+  { id: "st_normalise", artefact: "normalised/",
+    title: { s: "Standardise", t: "normalise" },
+    desc:  { s: ["CSV and H/C/D/T", "become Parquet"],
+             t: ["NormaliseStage", "PSV + HCDT → parquet", "→ NormalisedFileSet"] },
+    info:  "NormaliseStage → normalised/<dataset>/*.parquet: simple PSVs are converted directly; legacy H/C/D/T files go through the XSV normaliser with header/trailer validation. Empty files produce nothing." },
+  { id: "st_optimise",  artefact: "optimised/",
+    title: { s: "Shape data", t: "optimise" },
+    desc:  { s: ["Keep the right", "columns + types"],
+             t: ["OptimiseStage", "→ OptimisedFileSet", "types + projection"] },
+    info:  "OptimiseStage → optimised/: include/exclude columns, declared or auto-detected column types (first row group), row filters. Unconfigured datasets pass through untouched." },
+  { id: "st_snapshot",  artefact: "snapshots/",
+    title: { s: "Snapshot", t: "snapshot" },
+    desc:  { s: ["Merge deltas onto", "the snapshot"],
+             t: ["SnapshotStage", "→ SnapshotFile", "timestamp-named"] },
+    info:  "SnapshotStage → snapshots/: delta datasets fold each new file onto the latest snapshot (last-writer-wins, baseline-hash aware); snapshot datasets copy the latest file. Names carry the newest source timestamp, so a re-run with nothing newer reuses the snapshot." },
+  { id: "st_duckdb",    artefact: "staging/",
+    title: { s: "Load DuckDB", t: "load-duckdb" },
+    desc:  { s: ["All snapshots in", "one DuckDB"],
+             t: ["LoadDuckDbStage", "→ StagingDatabase", "*.duckdb"] },
+    info:  "LoadDuckDbStage → staging/*.duckdb: every dataset snapshot becomes a table in one DuckDB, built in a temp dir and uploaded whole after row-count verification. Skipped on dataset-filtered runs." },
+  { id: "st_sqlite",    artefact: "views/",
+    title: { s: "Publish view", t: "export-sqlite" },
+    desc:  { s: ["SQL transform →", "SQLite read model"],
+             t: ["ExportSqliteStage", "→ SqliteExportFile", "krds-db.sqlite"] },
+    info:  "ExportSqliteStage → views/*.sqlite: a versioned SQL transform builds the read model; an artefact written by an older transform version is rebuilt." }
+];
+STAGE_DEFS.forEach((s, i) => {
+  NODES.push({ ...s, kind: "stage", x: 392 + i * 120, y: 170, w: 108, h: 116 });
+});
+
+/* ============================ render ============================== */
+
+const NS = "http://www.w3.org/2000/svg";
+const nodesById = {};
+const $ = id => document.getElementById(id);
+const el = (tag, attrs, parent) => {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+};
+const txt = (parent, x, y, str, cls, anchor) => {
+  const t = el("text", { x, y, "class": cls || "" }, parent);
+  if (anchor) t.setAttribute("text-anchor", anchor);
+  t.textContent = str;
+  return t;
+};
+
+/* lane band + title */
+{
+  const g = $("lanes");
+  el("rect", { x: 8, y: LANE.y, width: 1464, height: LANE.h, rx: 10, fill: LANE.fill }, g);
+  txt(g, 24, LANE.y + 24, LANE.title, "lane-title");
+  txt(g, 24, LANE.y + 40, LANE.sub, "lane-sub");
+}
+
+function iconFor(kind, x, y) {
+  const g = document.createElementNS(NS, "g");
+  g.setAttribute("class", "node-icon");
+  if (kind === "s3") {
+    el("path", { d: `M ${x} ${y + 4} h 18 l -2 14 h -14 z` }, g);
+    el("rect", { x: x + 5, y: y + 7, width: 8, height: 4, fill: "none" }, g);
+  } else if (kind === "trigger") {
+    el("path", { d: `M ${x + 10} ${y} l -7 10 h 5 l -3 8 l 9 -11 h -5 z` }, g);
+  } else if (kind === "consumer") {
+    el("circle", { cx: x + 9, cy: y + 6, r: 5 }, g);
+    el("path", { d: `M ${x + 2} ${y + 18} a 7 7 0 0 1 14 0` }, g);
+  } else {
+    el("circle", { cx: x + 9, cy: y + 9, r: 7 }, g);
+    el("circle", { cx: x + 9, cy: y + 9, r: 2.5 }, g);
+  }
+  return g;
+}
+
+/* nodes */
+const nodesG = $("nodes");
+for (const n of NODES) {
+  nodesById[n.id] = n;
+  const g = el("g", { "class": "node", id: "node-" + n.id, "data-node": n.id, tabindex: "0", role: "button" }, nodesG);
+  el("rect", { x: n.x, y: n.y, width: n.w, height: n.h, rx: 8, "class": "node-card" }, g);
+  g.appendChild(iconFor(n.kind, n.x + 8, n.y + 10));
+  el("path", { d: `M ${n.x + n.w - 14} ${n.y + 8} l 4 4 l 7 -7`, "class": "done-tick" }, g);
+
+  txt(g, n.x + 30, n.y + 21, n.title.s, "node-title cap-simple");
+  txt(g, n.x + 30, n.y + 21, n.title.t, "node-title cap-tech");
+
+  n.desc.s.forEach((line, i) => txt(g, n.x + 10, n.y + 42 + i * 12, line, "node-desc cap-simple"));
+  n.desc.t.forEach((line, i) => txt(g, n.x + 10, n.y + 42 + i * 12, line, "node-desc cap-tech"));
+
+  if (n.lock) {
+    txt(g, n.x + 10, n.y + n.h - 10, "⚿ one run at a time", "node-lock");
+  }
+  if (n.artefact) {
+    const cg = el("g", { "class": "chip-group", id: "chip-" + n.id }, g);
+    const cw = Math.max(64, n.artefact.length * 6.4 + 16);
+    el("rect", { x: n.x + (n.w - cw) / 2, y: n.y + n.h + 8, width: cw, height: 20, rx: 10, "class": "chip" }, cg);
+    txt(cg, n.x + n.w / 2, n.y + n.h + 22, n.artefact, "chip-text", "middle");
+  }
+  const counter = txt(g, n.x + 10, n.y + n.h - 10, "", "counter");
+  counter.id = "counter-" + n.id;
+}
+
+/* edges: node ids → path */
+const EDGES = [
+  ["etl_trigger", "ext_s3"], ["ext_s3", "st_source"],
+  ...STAGE_IDS.slice(0, -1).map((s, i) => [s, STAGE_IDS[i + 1]]),
+  ["st_sqlite", "consumer"]
+];
+
+const edgesG = $("edges");
+const edgePaths = {};
+for (const [a, b] of EDGES) {
+  const na = nodesById[a], nb = nodesById[b];
+  const x1 = na.x + na.w, y1 = na.y + na.h / 2;
+  const x2 = nb.x, y2 = nb.y + nb.h / 2;
+  const d = `M ${x1} ${y1} C ${x1 + 18} ${y1}, ${x2 - 18} ${y2}, ${x2 - 4} ${y2}`;
+  edgePaths[`${a}->${b}`] = el("path", { d, "class": "edge", id: `edge-${a}-${b}` }, edgesG);
+}
+
+/* artefact folder ribbon under the stages */
+txt($("edge-labels"), 24, 336, "materialised artefacts (internal S3 bucket):", "edge-label");
+
+/* dataset colour legend */
+const lg = $("legend");
+DS_COLORS.forEach((c, i) => el("circle", { cx: 30 + i * 14, cy: 396, r: 5, fill: c, "class": "packet" }, lg));
+txt(lg, 116, 400, "dataset colours — discovered files are grouped per dataset (~18 datasets: sam_*, cts_*, amls2_*, ames_*)", "dot-legend");
+
+/* ============================ timeline ============================ */
+
+const TIMELINE = [
+  { dur: 2400, activate: ["etl_trigger"], packets: [{ edge: "etl_trigger->ext_s3", n: 1, color: "#0b0c0c" }],
+    cap: { s: "A run is requested — via the API, the daily job, or the ETL CLI. Only one runs at a time.",
+           t: "EtlImportCoordinator takes the import lock, writes a queued record, runs in background." } },
+  { dur: 2600, activate: ["ext_s3"], packets: [{ to: "ext_s3", kind: "rain", n: 6 }],
+    cap: { s: "The supplier drops encrypted extract files into their bucket.",
+           t: "litprd/LITP_* PSV files + cads/cts/* H/C/D/T files (bulk baseline + daily deltas)." } },
+  { dur: 3000, activate: ["st_source"], packets: [{ edge: "ext_s3->st_source", n: 6, ds: true }],
+    counter: { id: "ext_s3", to: 42, label: "files" },
+    cap: { s: "The source stage scans the bucket and matches every file to a known dataset.",
+           t: "S3RawFolderSource lists the bucket; each object is matched to a DataSetDefinition → DiscoveredFile." } },
+  { dur: 2800, activate: ["st_discover"], packets: [{ edge: "st_source->st_discover", n: 6, ds: true }],
+    cap: { s: "Files are grouped into one set per dataset.",
+           t: "DiscoverStage groups into a DiscoveredFileSet per dataset; empty datasets drop out." } },
+  { dur: 3000, activate: ["st_decrypt"], packets: [{ edge: "st_discover->st_decrypt", n: 5, ds: true }],
+    chips: ["st_decrypt"],
+    cap: { s: "Each file is AES-decrypted as it streams in — the password comes from the file name itself.",
+           t: "DecryptStage streams decrypt→raw/ (CTS derives the password from the name). Existing objects are skipped." } },
+  { dur: 3200, activate: ["st_normalise"], packets: [{ edge: "st_decrypt->st_normalise", n: 5, ds: true }],
+    chips: ["st_normalise"],
+    cap: { s: "CSV and legacy header/data/trailer files become columnar Parquet — one format from here on.",
+           t: "NormaliseStage → normalised/<dataset>/*.parquet. H/C/D/T files get header/trailer validation." } },
+  { dur: 3000, activate: ["st_optimise"], packets: [{ edge: "st_normalise->st_optimise", n: 4, ds: true }],
+    chips: ["st_optimise"],
+    cap: { s: "Columns are projected, typed and rows filtered — each dataset keeps only what it needs.",
+           t: "OptimiseStage → optimised/: include/exclude, declared or sampled types, row filter; pass-through if unconfigured." } },
+  { dur: 3400, activate: ["st_snapshot"], packets: [{ edge: "st_optimise->st_snapshot", n: 4, ds: true }],
+    chips: ["st_snapshot"], counter: { id: "st_snapshot", to: 12384201, label: "rows" },
+    cap: { s: "Deltas are folded onto the latest snapshot — after this step each dataset has one current truth.",
+           t: "SnapshotStage → snapshots/<dataset>_<ts>.parquet: last-writer-wins merge, baseline-hash aware; nothing newer → reuse." } },
+  { dur: 3200, activate: ["st_duckdb"], packets: [{ edge: "st_snapshot->st_duckdb", n: 6, ds: true }],
+    chips: ["st_duckdb"], counter: { id: "st_duckdb", to: 18, label: "tables" },
+    cap: { s: "Every dataset snapshot becomes a table in a single DuckDB staging database.",
+           t: "LoadDuckDbStage → staging/*.duckdb, built in temp and uploaded whole after row-count verification." } },
+  { dur: 3400, activate: ["st_sqlite", "consumer"], packets: [{ edge: "st_duckdb->st_sqlite", n: 2 }, { edge: "st_sqlite->consumer", n: 2, color: "#00703c" }],
+    chips: ["st_sqlite"],
+    cap: { s: "A versioned SQL transform produces the SQLite read model that consumers download.",
+           t: "ExportSqliteStage → views/krds-db.sqlite; artefacts from an older transform version are rebuilt." } },
+  { dur: 3000, hold: true,
+    cap: { s: "Run complete — encrypted files became a queryable read model. Restarting…",
+           t: "Pipeline complete: raw/ → normalised/ → optimised/ → snapshots/ → staging/ → views/. Restarting…" } }
+];
+
+/* ============================ engine ============================== */
+
+const packetsLayer = $("packets");
+let speed = 1, playing = false, stepIdx = 0, stepElapsed = 0;
+let activePackets = [], queuedSpawns = [], counters = [], rafId = null;
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function fmt(n) { return n.toLocaleString("en-GB"); }
+
+function spawnPacket(spec, delayMs) {
+  queuedSpawns.push({ spec, at: performance.now() + delayMs });
+}
+
+function launchPacket(spec) {
+  if (spec.kind === "rain") {
+    const n = nodesById[spec.to];
+    const c = document.createElementNS(NS, "circle");
+    const x = n.x + 20 + Math.random() * (n.w - 40);
+    c.setAttribute("cx", x); c.setAttribute("cy", n.y - 14);
+    c.setAttribute("r", 6); c.setAttribute("fill", spec.color || DS_COLORS[Math.floor(Math.random() * DS_COLORS.length)]);
+    c.setAttribute("class", "packet");
+    packetsLayer.appendChild(c);
+    activePackets.push({ el: c, born: performance.now(), dur: 900, from: { x, y: n.y - 14 }, to: { x, y: n.y + n.h / 2 } });
+    return;
+  }
+  const path = edgePaths[spec.edge];
+  if (!path) return;
+  const len = path.getTotalLength();
+  const c = document.createElementNS(NS, "circle");
+  c.setAttribute("r", 6);
+  c.setAttribute("fill", spec.color || "#0b0c0c");
+  c.setAttribute("class", "packet");
+  packetsLayer.appendChild(c);
+  const dur = spec.durMs || Math.max(350, Math.min(1600, len * 9));
+  activePackets.push({ el: c, born: performance.now(), dur, path, len });
+}
+
+let dsColorIdx = 0;
+function nextDsColor() { return DS_COLORS[dsColorIdx++ % DS_COLORS.length]; }
+
+function beginStep() {
+  const step = TIMELINE[stepIdx];
+  stepElapsed = 0;
+  dsColorIdx = 0;
+
+  document.querySelectorAll(".node.active").forEach(e => e.classList.remove("active"));
+  if (step.hold) {
+    NODES.forEach(n => $("node-" + n.id)?.classList.add("done"));
+  } else {
+    (step.activate || []).forEach(id => $("node-" + id)?.classList.add("active"));
+  }
+
+  $("step-no").textContent = `Step ${stepIdx + 1}/${TIMELINE.length}`;
+  $("step-text").textContent = document.body.classList.contains("aud-engineer") ? step.cap.t : step.cap.s;
+
+  (step.packets || []).forEach(p => {
+    for (let i = 0; i < p.n; i++) {
+      const spec = { ...p, color: p.ds ? nextDsColor() : p.color };
+      spawnPacket(spec, (p.delay || 0) + i * (step.dur * 0.55 / Math.max(1, p.n)));
+    }
+  });
+  (step.chips || []).forEach(id => $("chip-" + id)?.classList.add("materialised"));
+  if (step.counter) {
+    const e = $("counter-" + step.counter.id);
+    counters.push({ el: e, from: 0, to: step.counter.to, label: step.counter.label, dur: step.dur * 0.9 });
+  }
+}
+
+function tick(now) {
+  if (!playing) return;
+  const step = TIMELINE[stepIdx];
+  const dt = (tick.last === undefined ? 0 : now - tick.last) * speed;
+  tick.last = now;
+  stepElapsed += dt;
+
+  for (let i = queuedSpawns.length - 1; i >= 0; i--) {
+    if (queuedSpawns[i].at <= now) { launchPacket(queuedSpawns[i].spec); queuedSpawns.splice(i, 1); }
+  }
+  for (let i = activePackets.length - 1; i >= 0; i--) {
+    const p = activePackets[i];
+    const t = Math.min(1, (now - p.born) / (p.dur / speed));
+    if (p.path) {
+      const pt = p.path.getPointAtLength(t * p.len);
+      p.el.setAttribute("cx", pt.x); p.el.setAttribute("cy", pt.y);
+    } else {
+      p.el.setAttribute("cx", p.from.x + (p.to.x - p.from.x) * t);
+      p.el.setAttribute("cy", p.from.y + (p.to.y - p.from.y) * t);
+    }
+    if (t >= 1) { p.el.remove(); activePackets.splice(i, 1); }
+  }
+  for (let i = counters.length - 1; i >= 0; i--) {
+    const c = counters[i];
+    const t = Math.min(1, stepElapsed / c.dur);
+    c.el.textContent = `${fmt(Math.round(c.from + (c.to - c.from) * t))} ${c.label}`;
+    if (t >= 1) counters.splice(i, 1);
+  }
+
+  if (stepElapsed >= step.dur) {
+    stepIdx++;
+    tick.last = now;
+    if (stepIdx >= TIMELINE.length) { reset(true); stepIdx = 0; }
+    beginStep();
+  }
+  rafId = requestAnimationFrame(tick);
+}
+
+function reset(soft) {
+  document.querySelectorAll(".node").forEach(e => e.classList.remove("active", "done"));
+  document.querySelectorAll(".chip-group").forEach(e => e.classList.remove("materialised"));
+  document.querySelectorAll(".counter").forEach(e => e.textContent = "");
+  activePackets.forEach(p => p.el.remove());
+  activePackets = []; queuedSpawns = []; counters = [];
+  if (!soft) tick.last = undefined;
+}
+
+function start() {
+  playing = true;
+  $("btn-play").textContent = "Pause";
+  $("btn-play").setAttribute("aria-label", "Pause");
+  if (rafId === null) { tick.last = undefined; rafId = requestAnimationFrame(tick); }
+}
+function pause() {
+  playing = false;
+  $("btn-play").textContent = "Play";
+  $("btn-play").setAttribute("aria-label", "Play");
+  if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
+}
+
+function finalState() {
+  reset();
+  NODES.forEach(n => $("node-" + n.id).classList.add("done"));
+  STAGE_DEFS.forEach(s => s.artefact && $("chip-" + s.id).classList.add("materialised"));
+  $("counter-st_snapshot").textContent = fmt(12384201) + " rows";
+  $("counter-st_duckdb").textContent = "18 tables";
+  $("step-no").textContent = "Overview";
+  $("step-text").textContent = document.body.classList.contains("aud-engineer")
+    ? "Full flow: source:external → discover → decrypt → normalise → optimise → snapshot → load-duckdb → export-sqlite."
+    : "The whole journey at rest — press Play to watch a run.";
+}
+
+/* ============================ controls ============================ */
+
+$("btn-play").addEventListener("click", () => playing ? pause() : start());
+$("btn-restart").addEventListener("click", () => { reset(); stepIdx = 0; beginStep(); start(); });
+$("btn-skip").addEventListener("click", () => { pause(); finalState(); });
+document.querySelectorAll('input[name="spd"]').forEach(r =>
+  r.addEventListener("change", e => { speed = parseFloat(e.target.value); }));
+document.querySelectorAll('input[name="aud"]').forEach(r =>
+  r.addEventListener("change", e => {
+    document.body.classList.toggle("aud-engineer", e.target.value === "engineer");
+    const step = TIMELINE[Math.min(stepIdx, TIMELINE.length - 1)];
+    if (!playing && $("step-no").textContent === "Overview") { finalState(); return; }
+    $("step-text").textContent = document.body.classList.contains("aud-engineer") ? step.cap.t : step.cap.s;
+  }));
+
+/* click a node → detail line */
+nodesG.addEventListener("click", e => {
+  const g = e.target.closest("[data-node]");
+  if (g) showInfo(g.dataset.node);
+});
+nodesG.addEventListener("keydown", e => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const g = e.target.closest("[data-node]");
+  if (g) { e.preventDefault(); showInfo(g.dataset.node); }
+});
+function showInfo(id) {
+  const n = nodesById[id];
+  $("info-bar").innerHTML = "";
+  const strong = document.createElement("code");
+  strong.textContent = n.id;
+  $("info-bar").append(strong, " — " + n.info);
+}
+
+/* ============================ boot ================================ */
+
+if (reduceMotion) {
+  finalState();
+} else {
+  reset();
+  stepIdx = 0;
+  beginStep();
+  start();
+}
+</script>
+</body>
+</html>
